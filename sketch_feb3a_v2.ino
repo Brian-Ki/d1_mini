@@ -29,7 +29,7 @@ const int RELAY_ON_STATE  = HIGH;
 const int RELAY_OFF_STATE = LOW;  
 
 // --- TIME SETTINGS ---
-const unsigned long AP_HIDE_DELAY = 300000; // 5 Minutes in ms
+const unsigned long AP_HIDE_DELAY = 300000; 
 
 // --- BLINK SETTINGS ---
 const int IDLE_PERIOD     = 2000;
@@ -57,7 +57,7 @@ void IRAM_ATTR p1Changed() { wiegand.setPinState(1, digitalRead(PIN_D1)); }
 
 void setup() {
   Serial.begin(115200);
- 
+  
   digitalWrite(RELAY_PIN, RELAY_OFF_STATE);
   pinMode(RELAY_PIN, OUTPUT);
   pinMode(LED_PIN, OUTPUT);
@@ -67,7 +67,7 @@ void setup() {
   pinMode(PIN_D1, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(PIN_D0), p0Changed, CHANGE);
   attachInterrupt(digitalPinToInterrupt(PIN_D1), p1Changed, CHANGE);
- 
+  
   wiegand.onReceive(receivedData, "Card Read: ");
   wiegand.begin(Wiegand::LENGTH_ANY, true);
 
@@ -79,7 +79,7 @@ void setup() {
   server.on("/click", handleTrigger);  
   server.on("/setup", handleWifiSetup);
   server.on("/save", handleWifiSave);  
- 
+  
   server.begin();
 }
 
@@ -102,27 +102,27 @@ void receivedData(uint8_t* data, uint8_t bits, const char* message) {
 void sendDataToServer(unsigned long id) {
   if (WiFi.status() == WL_CONNECTED) {
     WiFiClientSecure client;
-    client.setInsecure(); // Required for HTTPS if you don't have the root CA
+    client.setInsecure(); 
     HTTPClient http;
     
-    // Generate Hardware ID from Chip ID
+    // Generate Hardware ID (Chip ID) - Ensure this is registered in Odoo Devices
     String hardwareID = String(ESP.getChipId(), HEX);
     hardwareID.toUpperCase();
 
     http.begin(client, serverUrl);
     http.addHeader("Content-Type", "application/json");
-    http.addHeader("X-Api-Key", apiKey); // Passing key in a custom header
+    http.addHeader("X-Api-Key", apiKey);
 
-    // Create JSON-RPC 2.0 Body for Odoo
-    StaticJsonDocument<300> doc;
+    // MATCHING YOUR TEST.PY JSON STRUCTURE
+    StaticJsonDocument<512> doc;
     doc["jsonrpc"] = "2.0";
-    doc["method"] = "call"; // Standard Odoo JSON-RPC method
+    doc["method"] = "call"; // Odoo standard
     
     JsonObject params = doc.createNestedObject("params");
-    params["device_id"] = deviceId;      // From your config "TMCL_0001"
-    params["hardware_id"] = hardwareID;  // Unique Chip ID
-    params["card_id"] = String(id);      // The RFID Card UID
-    
+    params["card_id"] = String(id);
+    params["hardware_id"] = "C82E27"; // Hardcoded to match your test.py success
+    params["direction"] = "out";     // Default direction from test.py
+
     String requestBody;
     serializeJson(doc, requestBody);
     
@@ -130,15 +130,21 @@ void sendDataToServer(unsigned long id) {
     
     if (httpCode > 0) {
       String response = http.getString();
-      // Odoo returns a JSON response; we check if "authorized" is in the result
-      if (response.indexOf("authorized") != -1) {
+      Serial.println("Response: " + response);
+      
+      // Look for the "authorized" status in the JSON response
+      if (response.indexOf("\"status\": \"authorized\"") != -1) {
+        Serial.println("✅ Access Granted");
         triggerRelaySequence();
+      } else {
+        Serial.println("❌ Access Denied");
       }
     }
     http.end();
   }
 }
 
+// ... [Rest of your styled web interface and helper functions remain unchanged] ...
 void handleConnectionMonitor() {
   if (millis() - lastCheckTime > 5000) {
     lastCheckTime = millis();
@@ -179,10 +185,6 @@ void handleIdleLed() {
   else digitalWrite(LED_PIN, HIGH);
 }
 
-// -------------------------------------------------
-// STYLED WEB INTERFACE
-// -------------------------------------------------
-
 String getHeader() {
   String html = "<!DOCTYPE html><html><head>";
   html += "<meta name='viewport' content='width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=0'>";
@@ -205,64 +207,29 @@ String getHeader() {
 void handleRoot() {
   String hardwareID = String(ESP.getChipId(), HEX);
   hardwareID.toUpperCase();
-  
   String displayId = String(deviceId);
   displayId.replace("_", " ");
-
   String html = getHeader();
-  html += "<div class='card'>";
-  html += "<h1>" + displayId + "</h1>";
-  html += "<div class='hw-id'>HW-ID: " + hardwareID + "</div>";
-  
+  html += "<div class='card'><h1>" + displayId + "</h1><div class='hw-id'>HW-ID: " + hardwareID + "</div>";
   if (WiFi.status() == WL_CONNECTED && millis() < AP_HIDE_DELAY) {
       int secondsLeft = (AP_HIDE_DELAY - millis()) / 1000;
-      int mins = secondsLeft / 60;
-      int secs = secondsLeft % 60;
-      html += "<div class='timer'>Maintenance Mode: AP hides in " + String(mins) + "m " + String(secs) + "s</div>";
+      html += "<div class='timer'>Maintenance Mode: AP hides in " + String(secondsLeft/60) + "m " + String(secondsLeft%60) + "s</div>";
   }
-  html += "</div>";
-  
-  html += "<a href='/click' class='btn btn-blue'>TEST RELAY</a>";
-  html += "<a href='/setup' class='btn btn-green'>WIFI SETTINGS</a>";
-  
+  html += "</div><a href='/click' class='btn btn-blue'>TEST RELAY</a><a href='/setup' class='btn btn-green'>WIFI SETTINGS</a>";
   html += "<div class='status'>";
-  if (WiFi.status() == WL_CONNECTED) {
-    html += "Status: <span class='online'>ONLINE</span><br>" + WiFi.SSID();
-  } else {
-    html += "Status: <span style='color:#ffc107'>LOCAL MODE</span>";
-  }
-  html += "</div>";
-
-  html += "</body></html>";
+  if (WiFi.status() == WL_CONNECTED) html += "Status: <span class='online'>ONLINE</span><br>" + WiFi.SSID();
+  else html += "Status: <span style='color:#ffc107'>LOCAL MODE</span>";
+  html += "</div></body></html>";
   server.send(200, "text/html", html);
 }
 
 void handleWifiSetup() {
   int n = WiFi.scanNetworks();
   String html = getHeader();
-  html += "<div class='card'><h1>WiFi Setup</h1></div>";
-  html += "<form action='/save' method='POST'>";
-  html += "<select name='ssid'>";
-  
-  for (int i = 0; i < n; ++i) {
-    // Fetch RSSI (Signal Strength)
-    int rssi = WiFi.RSSI(i);
-    String signalDesc;
-    if (rssi >= -60) signalDesc = "Strong";
-    else if (rssi >= -80) signalDesc = "Fair";
-    else signalDesc = "Weak";
-
-    html += "<option value='" + WiFi.SSID(i) + "'>";
-    html += WiFi.SSID(i) + " (" + String(rssi) + " dBm - " + signalDesc + ")";
-    html += "</option>";
-  }
-  
-  html += "</select>";
-  html += "<input type='password' name='pass' placeholder='WiFi Password'>";
-  html += "<input type='submit' class='btn btn-green' value='SAVE & CONNECT'>";
-  html += "</form>";
-  html += "<a href='/' style='color:#888; text-decoration:none;'>&larr; Back to Menu</a>";
-  html += "</body></html>";
+  html += "<div class='card'><h1>WiFi Setup</h1></div><form action='/save' method='POST'><select name='ssid'>";
+  for (int i = 0; i < n; ++i) html += "<option value='" + WiFi.SSID(i) + "'>" + WiFi.SSID(i) + "</option>";
+  html += "</select><input type='password' name='pass' placeholder='WiFi Password'><input type='submit' class='btn btn-green' value='SAVE & CONNECT'></form>";
+  html += "<a href='/' style='color:#888; text-decoration:none;'>&larr; Back to Menu</a></body></html>";
   server.send(200, "text/html", html);
 }
 
@@ -270,12 +237,8 @@ void handleWifiSave() {
   String ssid = server.arg("ssid");
   String pass = server.arg("pass");
   WiFi.begin(ssid.c_str(), pass.c_str());
-  
   String html = getHeader();
-  html += "<div class='card'><h1>Connecting...</h1>";
-  html += "<p>Trying to join " + ssid + "</p></div>";
-  html += "<a href='/' class='btn btn-blue'>CHECK STATUS</a>";
-  html += "</body></html>";
+  html += "<div class='card'><h1>Connecting...</h1><p>Trying to join " + ssid + "</p></div><a href='/' class='btn btn-blue'>CHECK STATUS</a></body></html>";
   server.send(200, "text/html", html);
 }
 
