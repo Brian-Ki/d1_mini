@@ -3,8 +3,8 @@ import json
 
 # --- CONFIGURATION ---
 # Note the endpoint change to /api/sync_cards
-URL = "https://mugie-client-qa-27687587.dev.odoo.com/api/sync_cards"
-API_KEY = "668275cff50c1c5fd30bf146a3e13c1f547fb0b6"
+URL = ""
+API_KEY = ""
 
 
 def test_sync():
