@@ -12,8 +12,8 @@ const int PIN_D0 = D6;        // Green Wire
 const int PIN_D1 = D7;        // White Wire
 
 // --- ODOO SERVER SETTINGS ---
-const char* serverUrl = "https://mugie-client-qa-27687587.dev.odoo.com/api/card_read";
-const char* apiKey    = "668275cff50c1c5fd30bf146a3e13c1f547fb0b6";
+const char* serverUrl = "";
+const char* apiKey    = "";
 const char* deviceId  = "TMCL_0001"; 
 
 // --- AP SETTINGS ---
