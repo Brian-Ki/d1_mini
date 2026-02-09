@@ -1,0 +1,46 @@
+import requests
+import json
+
+# --- CONFIGURATION ---
+URL = ""
+API_KEY = ""
+
+
+def simulate_tap(card_uid, hardware_id="C82E27", direction="out"):
+    payload = {
+        "jsonrpc": "2.0",
+        "params": {
+            "card_id": card_uid,
+            "hardware_id": hardware_id,  # MUST match the record in Odoo Devices
+            # Will be overridden if Odoo is set to 'Entry Only' or 'Exit Only'
+            "direction": direction,
+        }
+    }
+
+    headers = {
+        "Content-Type": "application/json",
+        "X-Api-Key": API_KEY
+    }
+
+    print(f"\n--- Tapping Card: {card_uid} at Device: {hardware_id} ---")
+    try:
+        response = requests.post(URL, json=payload, headers=headers)
+        result = response.json()
+        print("Odoo Response:", json.dumps(result, indent=2))
+
+        if "result" in result:
+            status = result["result"].get("status")
+            if status == "authorized":
+                print(f"✅ WELCOME: {result['result'].get('holder')}")
+            elif status == "error":
+                print(f"⚠️ ERROR: {result['result'].get('message')}")
+            else:
+                print(f"❌ DENIED: {result['result'].get('message')}")
+
+    except Exception as e:
+        print("❌ Connection Error:", e)
+
+
+if __name__ == "__main__":
+    # 1. Test a valid scan
+    simulate_tap("7423030", direction="out")
