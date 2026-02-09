@@ -1,0 +1,38 @@
+import requests
+import json
+
+# --- CONFIGURATION ---
+# Note the endpoint change to /api/sync_cards
+URL = "https://mugie-client-qa-27687587.dev.odoo.com/api/sync_cards"
+API_KEY = "668275cff50c1c5fd30bf146a3e13c1f547fb0b6"
+
+
+def test_sync():
+    headers = {
+        "X-Api-Key": API_KEY
+    }
+
+    print(f"--- Requesting Sync from: {URL} ---")
+    try:
+        # We use requests.get because the endpoint is methods=['GET']
+        response = requests.get(URL, headers=headers)
+
+        print(f"HTTP Status Code: {response.status_code}")
+
+        if response.status_code == 200:
+            data = response.json()
+            print("✅ Sync Successful!")
+            print(f"Total Authorized: {data['count']['auth']}")
+            print(f"Total Blocked: {data['count']['block']}")
+
+            print("\nAuthorized IDs:", data['authorized'])
+            print("Blocked IDs:", data['blocked'])
+        else:
+            print(f"❌ Failed! Response: {response.text}")
+
+    except Exception as e:
+        print("❌ Connection Error:", e)
+
+
+if __name__ == "__main__":
+    test_sync()
