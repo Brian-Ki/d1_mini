@@ -1,0 +1,362 @@
+#include <ESP8266WiFi.h>
+#include <ESP8266WebServer.h>
+#include <ESP8266HTTPClient.h>
+#include <WiFiClientSecure.h>
+#include <ArduinoJson.h>      
+#include <Wiegand.h>          
+#include <LittleFS.h>
+
+// --- PIN SETTINGS ---
+#define LED_PIN LED_BUILTIN
+const int RELAY_PIN = D1;
+const int PIN_D0 = D6;        
+const int PIN_D1 = D7;        
+
+// --- ODOO SERVER SETTINGS ---
+const char* serverUrl = "/api/card_read";
+const char* syncUrl   = "/api/sync_cards";
+const char* apiKey    = "";
+const char* deviceId  = "TMCL 0002"; 
+
+// --- CACHE SETTINGS ---
+const int CACHE_SIZE = 800;
+unsigned long authCache[CACHE_SIZE]; 
+unsigned long blockCache[CACHE_SIZE];
+int authCount = 0;
+int blockCount = 0;
+
+// --- ANTI-SPAM / PENALTY SETTINGS ---
+unsigned long lastScannedCard = 0;
+unsigned long lastScannedTime = 0;
+const unsigned long PENALTY_DURATION = 300000; // 5 Minutes (300,000 ms)
+
+// --- TIMER SETTINGS ---
+const unsigned long SYNC_INTERVAL = 3600000; // Updated: 1 Hour (3,600,000 ms)
+unsigned long lastSyncTime = 0;
+const unsigned long RECONNECT_INTERVAL = 10000; 
+const unsigned long AP_HIDE_DELAY = 120000;
+const unsigned long PIN_TIMEOUT = 60000;
+
+// --- BLINK SETTINGS ---
+const int FAST_BLINK_SPEED = 30; // 30ms Strobe
+
+// --- AP SETTINGS ---
+const char* ap_ssid = "TMCL_R_C_0002";
+const char* ap_password = "controller0002";
+const char* config_pin = "1234"; 
+
+// --- OBJECTS ---
+ESP8266WebServer server(80);
+Wiegand wiegand;
+
+// --- VARIABLES ---
+unsigned long lastCheckTime = 0;
+unsigned long lastRetryTime = 0;
+unsigned long lastUnlockTime = 0; 
+bool isApActive = true;          
+bool isUnlocked = false; 
+
+// --- HELPER DECLARATIONS ---
+void handleRoot();
+void handleTrigger();
+void handleWifiSetup();
+void handleWifiSave();
+void triggerRelaySequence();
+void handleIdleLed();
+void handleConnectionMonitor();
+void sendDataToServer(unsigned long cardId);
+void receivedData(uint8_t* data, uint8_t bits, const char* message);
+void checkLockTimeout();
+void loadAndConnect();
+void saveWifiLocal(String s, String p);
+bool isAuthorizedLocally(unsigned long id);
+bool isBlockedLocally(unsigned long id);
+void saveCachesToFS();
+void loadCachesFromFS();
+void syncCardsFromOdoo();
+
+void IRAM_ATTR p0Changed() { wiegand.setPinState(0, digitalRead(PIN_D0)); }
+void IRAM_ATTR p1Changed() { wiegand.setPinState(1, digitalRead(PIN_D1)); }
+
+void setup() {
+  Serial.begin(115200);
+  if(!LittleFS.begin()){ Serial.println("FS Error"); }
+
+  digitalWrite(RELAY_PIN, LOW);
+  pinMode(RELAY_PIN, OUTPUT);
+  pinMode(LED_PIN, OUTPUT);
+
+  pinMode(PIN_D0, INPUT_PULLUP);
+  pinMode(PIN_D1, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(PIN_D0), p0Changed, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(PIN_D1), p1Changed, CHANGE);
+  
+  wiegand.onReceive(receivedData, "Card Read: ");
+  wiegand.begin(Wiegand::LENGTH_ANY, true);
+
+  WiFi.setAutoReconnect(true); 
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.softAP(ap_ssid, ap_password);
+  
+  loadAndConnect(); 
+  loadCachesFromFS();
+  
+  server.on("/", handleRoot);          
+  server.on("/click", handleTrigger);  
+  server.on("/setup", handleWifiSetup);
+  server.on("/save", handleWifiSave);  
+  server.begin();
+}
+
+void loop() {
+  server.handleClient();      
+  handleConnectionMonitor();  
+  handleIdleLed();            
+  wiegand.flush();
+  checkLockTimeout(); 
+
+  if (WiFi.status() == WL_CONNECTED) {
+    if (millis() - lastSyncTime > SYNC_INTERVAL || lastSyncTime == 0) {
+      lastSyncTime = millis();
+      syncCardsFromOdoo();
+    }
+  }
+}
+
+// --- CACHE LOGIC ---
+bool isAuthorizedLocally(unsigned long id) {
+  for (int i = 0; i < authCount; i++) if (authCache[i] == id) return true;
+  return false;
+}
+
+bool isBlockedLocally(unsigned long id) {
+  for (int i = 0; i < blockCount; i++) if (blockCache[i] == id) return true;
+  return false;
+}
+
+void saveCachesToFS() {
+  File f = LittleFS.open("/gate_cache.dat", "w");
+  if (f) {
+    f.println(authCount);
+    for (int i = 0; i < authCount; i++) f.println(authCache[i]);
+    f.println(blockCount);
+    for (int i = 0; i < blockCount; i++) f.println(blockCache[i]);
+    f.close();
+  }
+}
+
+void loadCachesFromFS() {
+  if (LittleFS.exists("/gate_cache.dat")) {
+    File f = LittleFS.open("/gate_cache.dat", "r");
+    authCount = f.readStringUntil('\n').toInt();
+    for (int i = 0; i < authCount && i < CACHE_SIZE; i++) authCache[i] = (unsigned long)f.readStringUntil('\n').toInt();
+    blockCount = f.readStringUntil('\n').toInt();
+    for (int i = 0; i < blockCount && i < CACHE_SIZE; i++) blockCache[i] = (unsigned long)f.readStringUntil('\n').toInt();
+    f.close();
+  }
+}
+
+void syncCardsFromOdoo() {
+    WiFiClientSecure client;
+    client.setInsecure();
+    HTTPClient http;
+    http.begin(client, syncUrl);
+    http.addHeader("X-Api-Key", apiKey);
+    
+    int httpCode = http.GET();
+    if (httpCode == 200) {
+      DynamicJsonDocument doc(24576); 
+      DeserializationError error = deserializeJson(doc, http.getStream());
+      
+      if (!error) {
+        JsonArray authIds = doc["authorized"];
+        authCount = 0;
+        for (unsigned long id : authIds) if (authCount < CACHE_SIZE) authCache[authCount++] = id;
+
+        JsonArray blockIds = doc["blocked"];
+        blockCount = 0;
+        for (unsigned long id : blockIds) if (blockCount < CACHE_SIZE) blockCache[blockCount++] = id;
+
+        saveCachesToFS();
+        Serial.println("Sync Complete: Auth & Blocked lists updated.");
+      }
+    }
+    http.end();
+}
+
+void receivedData(uint8_t* data, uint8_t bits, const char* message) {
+  unsigned long cardId = 0;
+  for (int i = 0; i < (bits / 8); i++) { cardId <<= 8; cardId |= data[i]; }
+  
+  // --- 5 MINUTE PENALTY LOGIC ---
+  if (cardId == lastScannedCard) {
+    if (millis() - lastScannedTime < PENALTY_DURATION) {
+      Serial.println("Penalty Active: Wait 5 minutes between scans of the same card.");
+      return; 
+    }
+  }
+
+  lastScannedCard = cardId;
+  lastScannedTime = millis();
+
+  if (isAuthorizedLocally(cardId)) {
+    Serial.println("Local Auth: Opening Gate...");
+    triggerRelaySequence();
+  } else if (isBlockedLocally(cardId)) {
+    Serial.println("Local Deny: Card is Blocked.");
+  } else {
+    Serial.println("Unknown Card: Checking Odoo...");
+  }
+
+  sendDataToServer(cardId);
+}
+
+void sendDataToServer(unsigned long id) {
+  if (WiFi.status() == WL_CONNECTED) {
+    WiFiClientSecure client;
+    client.setInsecure(); 
+    HTTPClient http;
+    http.setTimeout(5000); 
+
+    String hardwareID = String(ESP.getChipId(), HEX);
+    hardwareID.toUpperCase(); 
+
+    http.begin(client, serverUrl);
+    http.addHeader("Content-Type", "application/json");
+    http.addHeader("X-Api-Key", apiKey);
+    
+    StaticJsonDocument<512> doc;
+    doc["jsonrpc"] = "2.0";
+    doc["method"] = "call"; 
+    JsonObject params = doc.createNestedObject("params");
+    params["card_id"] = String(id);
+    params["hardware_id"] = hardwareID; 
+    params["direction"] = "out";     
+    
+    String requestBody;
+    serializeJson(doc, requestBody);
+    
+    int httpCode = http.POST(requestBody);
+    
+    if (httpCode > 0) {
+      String response = http.getString();
+      Serial.println("Odoo Sync Response: " + response);
+      
+      if (response.indexOf("\"status\": \"authorized\"") != -1 && !isAuthorizedLocally(id)) {
+          triggerRelaySequence();
+      } 
+    } else {
+      Serial.printf("POST Error: %s\n", http.errorToString(httpCode).c_str());
+    }
+    http.end();
+  }
+}
+
+// --- SYSTEM HELPERS ---
+void loadAndConnect() {
+  if (LittleFS.exists("/wifi.txt")) {
+    File f = LittleFS.open("/wifi.txt", "r");
+    if (f) {
+      String s = f.readStringUntil('\n');
+      String p = f.readStringUntil('\n');
+      s.trim(); p.trim();
+      f.close();
+      if (s.length() > 0) WiFi.begin(s.c_str(), p.c_str());
+    }
+  }
+}
+
+void saveWifiLocal(String s, String p) {
+  File f = LittleFS.open("/wifi.txt", "w");
+  if (f) { f.println(s); f.println(p); f.close(); }
+}
+
+void handleConnectionMonitor() {
+  if (millis() - lastCheckTime > 1000) {
+    lastCheckTime = millis();
+    if (WiFi.status() != WL_CONNECTED) {
+       if (millis() - lastRetryTime > RECONNECT_INTERVAL) {
+          lastRetryTime = millis();
+          loadAndConnect(); 
+          if (!isApActive) { WiFi.mode(WIFI_AP_STA); WiFi.softAP(ap_ssid, ap_password); isApActive = true; }
+       }
+    } else if (millis() > AP_HIDE_DELAY && isApActive) {
+        WiFi.softAPdisconnect(true); WiFi.mode(WIFI_STA); isApActive = false; 
+    }
+  }
+}
+
+void triggerRelaySequence() {
+  digitalWrite(RELAY_PIN, HIGH);
+  
+  unsigned long startMillis = millis();
+  unsigned long prevBlink = 0;
+  bool ledState = false;
+  
+  // Fast Strobe loop for 500ms
+  while (millis() - startMillis < 500) {
+    if (millis() - prevBlink >= FAST_BLINK_SPEED) {
+      prevBlink = millis();
+      ledState = !ledState;
+      digitalWrite(LED_PIN, ledState ? LOW : HIGH); // LOW is ON on D1 Mini
+    }
+    yield(); 
+  }
+  
+  digitalWrite(RELAY_PIN, LOW);
+  digitalWrite(LED_PIN, HIGH); // Force OFF
+}
+
+void handleIdleLed() {
+  if ((millis() % 2000) < 20) digitalWrite(LED_PIN, LOW);
+  else digitalWrite(LED_PIN, HIGH);
+}
+
+void checkLockTimeout() {
+  if (isUnlocked && (millis() - lastUnlockTime > PIN_TIMEOUT)) isUnlocked = false;
+}
+
+// --- WEB SERVER UI ---
+String getHeader() {
+  return "<!DOCTYPE html><html><head><meta name='viewport' content='width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=0'><style>body{background:#1a1a1a;color:#eee;font-family:sans-serif;text-align:center;padding:20px;}.card{background:#2a2a2a;padding:25px;border-radius:15px;margin-bottom:20px;}h1{margin:0;font-size:28px;}.btn{display:block;width:100%;padding:20px;margin:15px 0;font-size:18px;font-weight:bold;border:none;border-radius:10px;cursor:pointer;text-decoration:none;box-sizing:border-box;}.btn-blue{background:#007bff;color:white;}.btn-green{background:#28a745;color:white;}input{width:100%;padding:15px;font-size:16px;margin:10px 0;border-radius:8px;background:#333;color:white;box-sizing:border-box;}.status{font-size:14px;margin-top:20px;color:#888;}.online{color:#28a745;font-weight:bold;}</style></head><body>";
+}
+
+void handleRoot() {
+  if (server.method() == HTTP_POST && server.hasArg("pin")) {
+    if (server.arg("pin") == config_pin) { isUnlocked = true; lastUnlockTime = millis(); }
+  }
+  if (!isUnlocked) {
+    String html = getHeader() + "<div class='card'><h1>Locked</h1><p>Enter PIN</p></div><form action='/' method='POST'><input type='password' name='pin' placeholder='PIN' autofocus><input type='submit' class='btn btn-blue' value='UNLOCK'></form></body></html>";
+    server.send(200, "text/html", html); return;
+  }
+  lastUnlockTime = millis();
+  String hwID = String(ESP.getChipId(), HEX); hwID.toUpperCase();
+  String html = getHeader() + "<div class='card'><h1>" + String(deviceId) + "</h1><div style='color:#00aaff;font-size:12px;'>HW-ID: " + hwID + "</div>";
+  html += "<div style='font-size:11px;margin-top:5px;color:#888;'>Cached: " + String(authCount) + " Auth / " + String(blockCount) + " Blocked</div></div>";
+  html += "<a href='/click' class='btn btn-blue'>TEST RELAY</a><a href='/setup' class='btn btn-green'>WIFI SETTINGS</a>";
+  html += "<div class='status'>Status: " + String(WiFi.status() == WL_CONNECTED ? "<span class='online'>ONLINE</span>" : "<span>LOCAL</span>") + "</div></body></html>";
+  server.send(200, "text/html", html);
+}
+
+void handleWifiSetup() {
+  if (!isUnlocked) { server.sendHeader("Location", "/"); server.send(303); return; }
+  int n = WiFi.scanNetworks();
+  String html = getHeader() + "<div class='card'><h1>WiFi Setup</h1></div><form action='/save' method='POST'><select style='width:100%;padding:15px;background:#333;color:white;' name='ssid'>";
+  for (int i = 0; i < n; ++i) html += "<option value='" + WiFi.SSID(i) + "'>" + WiFi.SSID(i) + " (" + String(WiFi.RSSI(i)) + " dBm)</option>";
+  html += "</select><input type='text' name='pass' placeholder='Password'><input type='submit' class='btn btn-green' value='SAVE'></form><a href='/' class='btn btn-blue'>BACK TO MENU</a></body></html>"; 
+  server.send(200, "text/html", html);
+}
+
+void handleWifiSave() {
+  if (!isUnlocked) return;
+  saveWifiLocal(server.arg("ssid"), server.arg("pass"));
+  WiFi.begin(server.arg("ssid").c_str(), server.arg("pass").c_str());
+  String html = getHeader() + "<div class='card'><h1>Settings Saved</h1><p>Connecting...</p></div><a href='/' class='btn btn-blue'>BACK TO MENU</a></body></html>";
+  server.send(200, "text/html", html);
+}
+
+void handleTrigger() {
+  if (isUnlocked) triggerRelaySequence();
+  server.sendHeader("Location", "/");
+  server.send(303);
+}
